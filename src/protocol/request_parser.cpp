@@ -1,0 +1,182 @@
+#include "protocol/request_parser.h"
+#include "core/server_config.h"
+#include "utils/url_rewriter.h"
+#include <cstdio>
+#include <sstream>
+
+static std::string sanitize_input(const std::string &s)
+{
+    std::string result;
+    result.reserve(s.size());
+    for (char c : s)
+    {
+        unsigned char uc = static_cast<unsigned char>(c);
+        if (uc >= 32 && uc <= 126)
+        {
+            result += c;
+        }
+        else
+        {
+            char buf[5];
+            snprintf(buf, sizeof(buf), "\\x%02x", uc);
+            result += buf;
+        }
+    }
+    return result;
+}
+
+// Clean up a URI: remove backslashes (escaping)
+static void strip_backslashes(std::string &s)
+{
+    size_t pos;
+    while ((pos = s.find("%5C")) != std::string::npos) {
+        s.replace(pos, 3, "");
+    }
+    while ((pos = s.find("%5c")) != std::string::npos) {
+        s.replace(pos, 3, "");
+    }
+    while ((pos = s.find('\\')) != std::string::npos) {
+        s.replace(pos, 1, "");
+    }
+}
+
+static void redact_url_userinfo(std::string &uri)
+{
+    if (uri.rfind("rtsp://", 0) == 0)
+    {
+        size_t authority_end = uri.find('/', 7);
+        size_t at = uri.find('@', 7);
+        if (at != std::string::npos &&
+            (authority_end == std::string::npos || at < authority_end))
+            uri.replace(7, at - 7, "***");
+    }
+
+    size_t route = uri.find("/rtp/");
+    size_t route_length = 5;
+    if (route == std::string::npos)
+    {
+        route = uri.find("/tv/");
+        route_length = 4;
+    }
+    if (route == std::string::npos)
+        return;
+    size_t authority_start = route + route_length;
+    size_t authority_end = uri.find('/', authority_start);
+    size_t at = uri.find('@', authority_start);
+    if (at != std::string::npos &&
+        (authority_end == std::string::npos || at < authority_end))
+        uri.replace(authority_start, at - authority_start, "***");
+}
+
+RequestInfo RequestParser::parse(const std::string &request_data)
+{
+    RequestInfo info;
+    std::istringstream ss(request_data);
+    if (!(ss >> info.method >> info.raw_uri >> info.version))
+    {
+        // The chained extraction has already written whatever it could read, so
+        // those bytes still reach the caller (and its log line) and must be
+        // cleaned here too.
+        info.method = sanitize_input(info.method);
+        info.version = sanitize_input(info.version);
+        strip_backslashes(info.raw_uri);
+        info.raw_uri = sanitize_input(info.raw_uri);
+        return info;
+    }
+
+    info.method = sanitize_input(info.method);
+    info.version = sanitize_input(info.version);
+    info.is_http = (info.version.find("HTTP/") == 0);
+
+    strip_backslashes(info.raw_uri);
+    info.raw_uri = sanitize_input(info.raw_uri);
+    if (ServerConfig::getToken().empty())
+    {
+        info.is_authorized = true;
+    }
+
+    info.clean_uri = info.raw_uri;
+    size_t qpos = info.raw_uri.find('?');
+    if (qpos != std::string::npos)
+    {
+        std::string query_str = info.raw_uri.substr(qpos + 1);
+        std::string base_uri = info.raw_uri.substr(0, qpos);
+        
+        std::vector<std::string> params_vec = split(query_str, '&');
+        std::vector<std::string> filtered_params;
+        
+        std::string server_token = ServerConfig::getToken();
+
+        for (const auto &p : params_vec)
+        {
+            size_t eq_pos = p.find('=');
+            if (eq_pos != std::string::npos)
+            {
+                std::string key = p.substr(0, eq_pos);
+                std::string val = p.substr(eq_pos + 1);
+                info.params[key] = val;
+
+                if (key == "token")
+                {
+                    if (val == server_token)
+                    {
+                        info.is_authorized = true;
+                    }
+                    continue;
+                }
+            }
+            filtered_params.push_back(p);
+        }
+
+        info.clean_uri = base_uri;
+        if (!filtered_params.empty())
+        {
+            info.clean_uri += "?";
+            for (size_t i = 0; i < filtered_params.size(); ++i)
+            {
+                if (i != 0) info.clean_uri += "&";
+                info.clean_uri += filtered_params[i];
+            }
+        }
+    }
+
+    // The prefix test has to be anchored at the start of the path, otherwise a
+    // "/rtp/" or "/tv/" sitting in a query string (or deeper inside an unrelated
+    // path) would pick the upstream host. RTSP clients may send an absolute URI,
+    // so skip the scheme and authority when the request line carries one.
+    size_t query_start = info.clean_uri.find('?');
+    size_t path_start = 0;
+    size_t scheme_end = info.clean_uri.find("://");
+    if (scheme_end != std::string::npos &&
+        (query_start == std::string::npos || scheme_end < query_start)) {
+        path_start = info.clean_uri.find('/', scheme_end + 3);
+    }
+
+    if (path_start != std::string::npos &&
+        (info.clean_uri.compare(path_start, 5, "/rtp/") == 0 ||
+         info.clean_uri.compare(path_start, 4, "/tv/") == 0)) {
+        std::string sub_path = info.clean_uri.substr(path_start);
+        URLRewriter::rewrite_path(sub_path, info.upstream_url);
+    }
+
+    redact_url_userinfo(info.clean_uri);
+
+    return info;
+}
+
+std::vector<std::string> RequestParser::split(const std::string &str, char delimiter)
+{
+    std::vector<std::string> tokens;
+    size_t start = 0;
+    size_t end = str.find(delimiter);
+
+    while (end != std::string::npos)
+    {
+        tokens.push_back(str.substr(start, end - start));
+        start = end + 1;
+        end = str.find(delimiter, start);
+    }
+    tokens.push_back(str.substr(start, end));
+
+    return tokens;
+}

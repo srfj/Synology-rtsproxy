@@ -1,0 +1,114 @@
+#!/bin/sh
+#
+# RTSProxy package specific variables and functions. This file is sourced both
+# by the installer (during install/upgrade) and by start-stop-status (at every
+# service start), so the values stored by the install wizard are picked up at
+# runtime too.
+
+if [ -z "${SYNOPKG_PKGNAME}" ] || [ -z "${SYNOPKG_DSM_VERSION_MAJOR}" ]; then
+    echo "Error: Environment variables are not set." 1>&2
+    echo "Please run me using synopkg instead. Example: \"synopkg start ${SYNOPKG_PKGNAME}\"" 1>&2
+    exit 1
+fi
+
+# Service account to run the background process, prefixed according to DSM
+USER="rtsproxy"
+PRIV_PREFIX=sc-
+SYNOUSER_PREFIX=svc-
+if [ "${SYNOPKG_DSM_VERSION_MAJOR}" -lt 6 ]; then
+    EFF_USER="${SYNOUSER_PREFIX}${USER}"
+else
+    EFF_USER="${PRIV_PREFIX}${USER}"
+fi
+
+# define SYNOPKG_PKGVAR for compatibility with DSM7
+if [ -z "${SYNOPKG_PKGVAR}" ]; then
+    SYNOPKG_PKGVAR="${SYNOPKG_PKGDEST}/var"
+fi
+
+INST_ETC="/var/packages/${SYNOPKG_PKGNAME}/etc"
+INST_VARIABLES="${INST_ETC}/installer-variables"
+
+# Default service port, overridden by the port chosen in the install wizard.
+SERVICE_PORT="8554"
+
+# Reuse the port that was selected during installation.
+if [ -r "${INST_VARIABLES}" ]; then
+    . "${INST_VARIABLES}"
+fi
+
+# start-stop-status redirects the service stdout/stderr to LOG_FILE.
+LOG_FILE="${SYNOPKG_PKGVAR}/${SYNOPKG_PKGNAME}.log"
+# The service writes its pid into PID_FILE.
+PID_FILE="${SYNOPKG_PKGVAR}/${SYNOPKG_PKGNAME}.pid"
+
+# RTSProxy serves the proxy and the /admin/ WebUI from the same port and looks
+# for the webui/ directory relative to its working directory, so run from the
+# package target directory where webui/ is installed.
+SVC_CWD="${SYNOPKG_PKGDEST}"
+SVC_BACKGROUND=y
+SVC_WRITE_PID=y
+SERVICE_COMMAND="${SYNOPKG_PKGDEST}/bin/rtsproxy -p ${SERVICE_PORT} -w --log-file ${LOG_FILE}"
+
+
+# Persist the wizard selection so that start-stop-status and later upgrades keep
+# using the same port.
+save_wizard_variables ()
+{
+    local _old_port=""
+    if [ -r "${INST_VARIABLES}" ]; then
+        _old_port="$(sed -n 's/^SERVICE_PORT=//p' "${INST_VARIABLES}" | head -n 1)"
+    fi
+
+    /bin/rm -rf "${INST_VARIABLES}"
+    /bin/mkdir -p "${INST_ETC}"
+
+    if [ -n "${wizard_port}" ]; then
+        echo "SERVICE_PORT=${wizard_port}" >> "${INST_VARIABLES}"
+    elif [ -n "${_old_port}" ]; then
+        # Upgrade without a wizard step: keep the previously saved port.
+        echo "SERVICE_PORT=${_old_port}" >> "${INST_VARIABLES}"
+    else
+        echo "SERVICE_PORT=${SERVICE_PORT}" >> "${INST_VARIABLES}"
+    fi
+
+    # Restrict permissions to protect the stored options.
+    if [ -e "${INST_VARIABLES}" ]; then
+        chmod go-rwx "${INST_VARIABLES}"
+        if [ -n "${EFF_USER}" ]; then
+            chown "${EFF_USER}" "${INST_VARIABLES}"
+        fi
+    fi
+}
+
+
+service_postinst ()
+{
+    local _port="${SERVICE_PORT}"
+
+    # Validate the wizard value and fall back to the default on bad input.
+    if [ -n "${wizard_port}" ]; then
+        case "${wizard_port}" in
+            *[!0-9]*)
+                _port="8554"
+                ;;
+            *)
+                if [ "${wizard_port}" -ge 1 ] && [ "${wizard_port}" -le 65535 ]; then
+                    _port="${wizard_port}"
+                else
+                    _port="8554"
+                fi
+                ;;
+        esac
+    fi
+
+    # The desktop shortcut is generated from app/config and the firewall rule
+    # from app/<package>.sc, both of which ship with the default port. Rewrite
+    # them so the desktop icon opens the management panel on the chosen port.
+    if [ -f "${SYNOPKG_PKGDEST}/app/config" ]; then
+        sed -i "s/\"port\": \"[0-9]*\"/\"port\": \"${_port}\"/" "${SYNOPKG_PKGDEST}/app/config"
+    fi
+    if [ -f "${SYNOPKG_PKGDEST}/app/${SYNOPKG_PKGNAME}.sc" ]; then
+        sed -i "s#dst.ports=\"[0-9]*/tcp\"#dst.ports=\"${_port}/tcp\"#" "${SYNOPKG_PKGDEST}/app/${SYNOPKG_PKGNAME}.sc"
+    fi
+}

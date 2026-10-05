@@ -1,0 +1,16 @@
+{
+  ".url": {
+    "com.rtsproxy.rtsproxy": {
+      "title": "RTSProxy",
+      "desc": "RTSProxy 管理面板",
+      "icon": "images/rtsproxy-{0}.png",
+      "type": "url",
+      "protocol": "http",
+      "port": "8554",
+      "url": "/admin/",
+      "allUsers": true,
+      "grantPrivilege": "all",
+      "advanceGrantPrivilege": true
+    }
+  }
+}

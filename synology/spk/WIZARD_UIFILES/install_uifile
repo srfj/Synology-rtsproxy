@@ -1,0 +1,12 @@
+[{
+    "step_title": "RTSProxy 服务设置",
+    "items": [{
+        "type": "textfield",
+        "desc": "代理服务与管理面板共用该端口。安装完成后，DSM 桌面图标会用此端口打开管理窗口。",
+        "subitems": [{
+            "key": "wizard_port",
+            "desc": "监听端口 (1-65535，默认 8554)",
+            "defaultValue": "8554"
+        }]
+    }]
+}]

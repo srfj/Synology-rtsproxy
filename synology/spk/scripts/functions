@@ -1,0 +1,29 @@
+#!/bin/sh
+#
+# Common installer helpers for the RTSProxy Synology package.
+
+# Tools shortcuts
+MV="/bin/mv -f"
+RM="/bin/rm -rf"
+CP="/bin/cp -rfp"
+MKDIR="/bin/mkdir -p"
+LN="/bin/ln -nsf"
+TEE="/usr/bin/tee -a"
+
+INST_ETC="/var/packages/${SYNOPKG_PKGNAME}/etc"
+INST_VARIABLES="${INST_ETC}/installer-variables"
+
+if [ -z "${SYNOPKG_PKGVAR}" ]; then
+    # define SYNOPKG_PKGVAR for compatibility with DSM7 (replaces former INST_VAR)
+    SYNOPKG_PKGVAR="${SYNOPKG_PKGDEST}/var"
+fi
+
+
+# Reload the options that were stored by a previous install/upgrade.
+reload_inst_variables ()
+{
+    if [ -r "${INST_VARIABLES}" ]; then
+        # The file only ever contains simple KEY=value pairs.
+        . "${INST_VARIABLES}"
+    fi
+}

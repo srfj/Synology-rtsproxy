@@ -1,0 +1,10 @@
+{
+    "port-config": {
+        "protocol-file": "app/rtsproxy.sc"
+    },
+    "usr-local-linker": {
+        "bin": [
+            "bin/rtsproxy"
+        ]
+    }
+}
