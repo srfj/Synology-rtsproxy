@@ -11,7 +11,7 @@
 set -e
 
 PKG_NAME="rtsproxy"
-PKG_VERSION="1.0.0-1"
+PKG_VERSION="1.2"
 # DSM 6 x86_64 platforms (same list as the official SynoCommunity x86_64 packages)
 PKG_ARCH="apollolake avoton braswell broadwell broadwellnk bromolow cedarview denverton dockerx64 geminilake grantley purley kvmx64 v1000 x86 x86_64"
 
