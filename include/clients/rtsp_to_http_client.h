@@ -100,6 +100,17 @@ private:
     void send_rtp_trigger();
     void send_zte_heartbeat();
     void init_timer_fd();
+    // Arm a one-shot timer used to back off between handshake retries.
+    void arm_retry_timer_ms(int ms);
+    // Re-run the upstream RTSP handshake after a transient failure, keeping the
+    // downstream client connected so the player does not reconnect in a storm.
+    void schedule_handshake_retry();
+    // Fired by the one-shot retry timer; restarts the upstream handshake.
+    void handle_retry_timer(uint32_t event);
+    void restart_handshake();
+    // Best-effort TEARDOWN so the upstream platform releases the session and
+    // does not answer our next DESCRIBE with 412 Precondition Failed.
+    void send_upstream_teardown();
     void send_http_response();
     void send_rtsp_option();
     void send_rtsp_describe();
@@ -124,11 +135,13 @@ private:
     std::unique_ptr<SocketCtx> rtp_ctx_;
     std::unique_ptr<SocketCtx> rtcp_ctx_;
     std::unique_ptr<SocketCtx> timer_ctx_;
+    std::unique_ptr<SocketCtx> retry_timer_ctx_;
 
     FdGuard rtsp_fd_;
     FdGuard rtp_fd_;
     FdGuard rtcp_fd_;
     FdGuard timer_fd_;
+    FdGuard retry_timer_fd_;
 
     RtspState state_{RtspState::INIT};
     int cseq_{1};
@@ -152,6 +165,7 @@ private:
     uint8_t interleaved_rtcp_channel_{1};
     bool setup_retry_with_tcp_{false};
     int redirect_count_{0};
+    int handshake_retry_count_{0};
 
     std::string local_ip_;
     uint16_t local_tcp_port_{0};

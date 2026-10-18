@@ -12,7 +12,12 @@
 
 static void optimize_udp_buffer(int fd)
 {
-    int buf_size = 2 * 1024 * 1024;
+    // A burst of MPEG-TS packets (an I-frame plus its trailing P-frames) can
+    // momentarily outpace the event loop, so ask for a generous receive buffer
+    // to avoid dropping datagrams and producing a visible stutter. The kernel
+    // silently clamps this to net.core.rmem_max; the Synology package raises
+    // that limit at install time so the requested value can take effect.
+    int buf_size = 4 * 1024 * 1024;
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
 }

@@ -22,6 +22,21 @@
 namespace
 {
 constexpr size_t kMaxRtspMessageSize = 1024 * 1024;
+
+// Upstream handshake attempts allowed before we finally give up on the
+// downstream client. China Telecom's IPTV platform (ZMSS) answers with 412
+// Precondition Failed when it is momentarily out of sessions; retrying a few
+// times rides that out instead of tearing the player's stream down.
+constexpr int kMaxHandshakeRetries = 5;
+
+// Statuses worth retrying: transient rejections that usually clear on their
+// own. Anything else (401/403/404/405/...) is a permanent failure for which a
+// retry would only hammer the upstream.
+bool is_transient_upstream_status(int status)
+{
+    return status == 408 || status == 412 || status == 429 ||
+           status == 454 || status >= 500;
+}
 }
 
 RTSPToHttpClient::RTSPToHttpClient(EpollLoop *loop, BufferPool &pool, const sockaddr_in &client_addr, int client_fd, const rtspCtx &ctx)
@@ -38,6 +53,7 @@ RTSPToHttpClient::RTSPToHttpClient(EpollLoop *loop, BufferPool &pool, const sock
       rtp_fd_(-1, loop_),
       rtcp_fd_(-1, loop_),
       timer_fd_(-1, loop_),
+      retry_timer_fd_(-1, loop_),
       redirect_count_(0)
 {
     loop_->remove(client_fd);
@@ -380,6 +396,34 @@ void RTSPToHttpClient::on_rtsp_readable()
                 if (status != 200)
                 {
                     Logger::error("[RTSP] Connection to upstream refused. Status: " + std::to_string(status) + ", Header: " + header);
+
+                    // A rejected keepalive (GET_PARAMETER) must never abort an
+                    // ongoing playback: the downstream player would see the
+                    // HTTP stream end and reconnect, which shows up as a
+                    // 1-2 s stutter. If the rejection looks transient the
+                    // upstream session is probably gone, so re-establish it in
+                    // the background; otherwise just drop this probe.
+                    if (state_ == RtspState::STREAMING &&
+                        current_request_.method == RtspMethod::GET_PARAMETER)
+                    {
+                        if (is_transient_upstream_status(status))
+                            schedule_handshake_retry();
+                        else
+                            Logger::warn("[RTSP] Keepalive rejected (status " + std::to_string(status) + "), ignoring");
+                        return;
+                    }
+
+                    // Transient upstream rejections (e.g. the 412 emitted by the
+                    // China Telecom IPTV platform when it is momentarily out of
+                    // sessions) must not tear down the downstream player;
+                    // closing here is what turns a single upstream hiccup into a
+                    // multi-second reconnect storm.
+                    if (is_transient_upstream_status(status))
+                    {
+                        schedule_handshake_retry();
+                        return;
+                    }
+
                     on_client_closed();
                     return;
                 }
@@ -434,6 +478,7 @@ void RTSPToHttpClient::on_rtsp_readable()
                     Logger::debug(std::string("[RTSP] Streaming Start: " + ctx.rtsp_url));
                     rtp_pipeline_->reset();
                     init_timer_fd();
+                    handshake_retry_count_ = 0;
                     state_ = RtspState::STREAMING;
                 }
             }
@@ -633,6 +678,10 @@ void RTSPToHttpClient::on_client_readable()
 void RTSPToHttpClient::on_client_closed()
 {
     if (is_closed_) return;
+    // Release the upstream session before dropping the socket. Without this the
+    // China Telecom platform keeps the session alive for a while and answers
+    // the next viewer's DESCRIBE with 412 Precondition Failed.
+    send_upstream_teardown();
     is_closed_ = true;
     if (on_closed_callback_)
         on_closed_callback_();
@@ -789,6 +838,161 @@ void RTSPToHttpClient::init_timer_fd()
         { handle_timer(event); });
 
     loop_->set(timer_ctx_.get(), timer_fd_, EPOLLIN);
+}
+
+void RTSPToHttpClient::arm_retry_timer_ms(int ms)
+{
+    if (is_closed_)
+        return;
+    if (ms < 1)
+        ms = 1;
+
+    int new_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (new_fd < 0)
+    {
+        Logger::warn("[RTSP] Failed to create retry timer, closing downstream client");
+        on_client_closed();
+        return;
+    }
+
+    // One-shot: no interval, it fires exactly once.
+    itimerspec its{};
+    its.it_value.tv_sec = ms / 1000;
+    its.it_value.tv_nsec = static_cast<long>(ms % 1000) * 1000000L;
+    if (timerfd_settime(new_fd, 0, &its, nullptr) < 0)
+    {
+        close(new_fd);
+        Logger::warn("[RTSP] Failed to arm retry timer, closing downstream client");
+        on_client_closed();
+        return;
+    }
+
+    // FdGuard closes whatever retry fd was armed before (and removes it from
+    // epoll), so a superseded timer can never fire late.
+    retry_timer_fd_ = new_fd;
+
+    if (retry_timer_ctx_)
+        loop_->defer_delete(std::move(retry_timer_ctx_));
+
+    retry_timer_ctx_ = std::make_unique<SocketCtx>(
+        new_fd,
+        [this](uint32_t event)
+        { handle_retry_timer(event); });
+
+    loop_->set(retry_timer_ctx_.get(), new_fd, EPOLLIN);
+}
+
+void RTSPToHttpClient::handle_retry_timer(uint32_t event)
+{
+    if (!(event & EPOLLIN))
+        return;
+
+    uint64_t expirations = 0;
+    if (read(retry_timer_fd_, &expirations, sizeof(expirations)) !=
+        static_cast<ssize_t>(sizeof(expirations)))
+        return;
+
+    // One-shot timer consumed: drop the fd and defer-delete its context.
+    retry_timer_fd_ = -1;
+    if (retry_timer_ctx_)
+        loop_->defer_delete(std::move(retry_timer_ctx_));
+
+    restart_handshake();
+}
+
+void RTSPToHttpClient::restart_handshake()
+{
+    if (is_closed_)
+        return;
+
+    Logger::info("[RTSP] Restarting upstream handshake (attempt " +
+                 std::to_string(handshake_retry_count_) + "/" +
+                 std::to_string(kMaxHandshakeRetries) + ")");
+
+    // Drop the previous upstream connection and every per-handshake buffer so
+    // the next attempt starts cleanly from OPTIONS, exactly like a fresh
+    // downstream request. The downstream client is deliberately left
+    // connected: the HTTP viewer keeps its TCP connection and only misses a
+    // short slice of TS data while we re-establish the upstream session.
+    rtsp_ctx_.reset();
+    rtsp_fd_ = -1;
+
+    request_queue_ = {};
+    request_in_flight_ = false;
+    req_buf_.clear();
+    resp_buf_.clear();
+    tcp_send_offset_ = 0;
+    setup_retry_with_tcp_ = false;
+    is_tcp_mode_ = false;
+    state_ = RtspState::INIT;
+
+    // Stop the periodic keepalive timer (armed after a successful PLAY) so it
+    // cannot fire into a half-torn-down session while we reconnect.
+    if (timer_fd_ >= 0)
+        timer_fd_ = -1;
+    if (timer_ctx_)
+        loop_->defer_delete(std::move(timer_ctx_));
+
+    send_rtsp_option();
+}
+
+void RTSPToHttpClient::schedule_handshake_retry()
+{
+    if (is_closed_)
+        return;
+
+    if (handshake_retry_count_ >= kMaxHandshakeRetries)
+    {
+        Logger::error("[RTSP] Upstream handshake failed after " +
+                      std::to_string(kMaxHandshakeRetries) +
+                      " attempts, closing downstream client.");
+        on_client_closed();
+        return;
+    }
+
+    // Exponential backoff, capped, so a burst of transient upstream
+    // rejections cannot turn into a reconnect storm against the platform.
+    int backoff_ms = 200 * (1 << handshake_retry_count_);
+    if (backoff_ms > 2000)
+        backoff_ms = 2000;
+    ++handshake_retry_count_;
+
+    Logger::warn("[RTSP] Upstream handshake rejected, retrying in " +
+                 std::to_string(backoff_ms) + " ms (attempt " +
+                 std::to_string(handshake_retry_count_) + "/" +
+                 std::to_string(kMaxHandshakeRetries) +
+                 "), keeping downstream client alive");
+
+    arm_retry_timer_ms(backoff_ms);
+}
+
+void RTSPToHttpClient::send_upstream_teardown()
+{
+    // Only worth doing once a session actually exists; a session id is issued
+    // by the upstream after SETUP.
+    if (rtsp_fd_ < 0 || !rtsp_ctx_ || ctx.session_id.empty())
+        return;
+
+    std::string url;
+    if (!ctx.content_base.empty())
+        url = ctx.content_base;
+    else
+        url = "rtsp://" + ctx.server_ip + ":" + std::to_string(ctx.server_rtsp_port) + ctx.path;
+
+    std::string req = "TEARDOWN " + url + " RTSP/1.0\r\n";
+    req += "CSeq: " + std::to_string(cseq_++) + "\r\n";
+    req += "Session: " + ctx.session_id + "\r\n";
+    if (!ctx.basic_authorization.empty())
+        req += "Authorization: " + ctx.basic_authorization + "\r\n";
+    req += "\r\n";
+
+    // Best effort only: the downstream socket is already going away, so a
+    // failed send must not change the outcome.
+    ssize_t n = send(rtsp_fd_, req.data(), req.size(), MSG_NOSIGNAL);
+    if (n < 0)
+    {
+        Logger::debug("[RTSP] TEARDOWN send failed (ignored)");
+    }
 }
 
 void RTSPToHttpClient::send_http_response()
